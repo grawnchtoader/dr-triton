@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dr-triton"
+version = "0.1.0"
+description = "Fused Triton Dequantization Kernels & 3-Tier MoE Engine for Kimi-K3.1-Pro-Coder"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "grawnchtoader"}
+]
+dependencies = [
+    "torch>=2.3.0",
+    "triton>=3.0.0; platform_system != 'Windows'",
+    "transformers>=4.48.0",
+    "safetensors>=0.4.3",
+    "huggingface_hub>=0.24.0",
+    "tiktoken>=0.7.0",
+    "blobfile>=2.1.0",
+    "numpy>=1.24.0",
+]
+
+[project.scripts]
+strata-coder = "dr_triton.serve:main"
+
+[tool.setuptools.packages.find]
+include = ["dr_triton*"]
+
+[tool.setuptools.package-data]
+dr_triton = ["*.json"]
+
+[project.urls]
+Homepage = "https://github.com/grawnchtoader/dr-triton"
+Repository = "https://github.com/grawnchtoader/dr-triton"
