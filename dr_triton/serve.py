@@ -279,7 +279,56 @@ def make_handler(engine: KimiCoderEngine, default_max_tokens: int):
                 self.send_header("Content-Length", str(len(raw)))
                 self.end_headers()
                 self.wfile.write(raw)
-            elif self.path.startswith("/v1/models") or self.path == "/health":
+            elif self.path == "/health":
+                payload = {
+                    "service": "strata",
+                    "model": "kimi-sc-lut-3tier",
+                    "max_context": 262144,
+                    "images": False,
+                    "loaded": True,
+                    "api_key": False,
+                }
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            elif self.path == "/status":
+                payload = {
+                    "busy": state["phase"] == "Generating",
+                    "phase": state["phase"].lower(),
+                    "tokens_per_s": state["decode_tps"],
+                }
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            elif self.path == "/v1/status":
+                mon = build_monitor_payload()
+                payload = {
+                    "engine": "dr-triton-3tier",
+                    "activity": {"requests": len(state["requests"])},
+                    "machine": {
+                        "gpu": {
+                            "used_mib": round(mon["vram_used_gb"] * 1024),
+                            "total_mib": round(mon["vram_total_gb"] * 1024),
+                        },
+                        "ram": {
+                            "used_gib": round(mon["ram_used_gb"], 1),
+                            "total_gib": round(mon["ram_total_gb"], 1),
+                        },
+                    },
+                }
+                raw = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            elif self.path.startswith("/v1/models"):
                 payload = {"object": "list", "data": [{"id": "kimi-k3.1-pro-coder", "object": "model"}]}
                 raw = json.dumps(payload).encode("utf-8")
                 self.send_response(200)
