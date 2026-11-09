@@ -1,6 +1,8 @@
 import os
 import json
 import shutil
+import socket
+import struct
 import time
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple
@@ -462,6 +464,9 @@ class KimiCoderEngine:
         total_vram_gb: Optional[float] = None,
         total_ram_gb: Optional[float] = None,
         force_arch_sm: int = 0,
+        start_layer: int = 0,
+        end_layer: Optional[int] = None,
+        peer_addr: Optional[str] = None,
     ):
         self.model_id_or_dir = model_id_or_dir
         self.device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
@@ -470,15 +475,20 @@ class KimiCoderEngine:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.max_layers = min(max(max_layers, 1), 93)
+        self.start_layer = max(0, min(start_layer, self.max_layers - 1))
+        self.end_layer = min(max(end_layer if end_layer is not None else self.max_layers, self.start_layer + 1), self.max_layers)
+        self.peer_addr = peer_addr
+        self._peer_sock: Optional[socket.socket] = None
+        self.peer_stats: Dict[str, float] = {}
         self.force_arch_sm = force_arch_sm
 
         self.local_dir = None
         if Path(model_id_or_dir).is_dir():
             cand = Path(model_id_or_dir)
-            if (cand / "model-00001-of-000096.safetensors").exists():
+            if list(cand.glob("model-*-of-000096.safetensors")):
                 self.local_dir = cand
             else:
-                hits = list(cand.glob("**/model-00001-of-000096.safetensors"))
+                hits = list(cand.glob("**/model-*-of-000096.safetensors"))
                 self.local_dir = hits[0].parent if hits else cand
         tok_src = str(self.local_dir) if (self.local_dir is not None and (self.local_dir / "tiktoken.model").exists()) else "Grawnch/Kimi-K3.1-Pro-Coder"
         self.tokenizer = AutoTokenizer.from_pretrained(tok_src, trust_remote_code=True)
@@ -488,29 +498,35 @@ class KimiCoderEngine:
         self.total_ram_gb = total_ram_gb if total_ram_gb is not None else det_ram
         self.out_dtype = resolve_optimal_dtype(self.device, force_arch_sm=force_arch_sm)
 
-        # Cache Shard 1 (Layer 0 dense, 435 MB) and Shard 94 (embed_tokens, norm, lm_head)
-        self.shard1_path, _ = self._resolve_shard(1, keep_cached=True)
-        self.shard94_path, _ = self._resolve_shard(94, keep_cached=True)
-        self._sf1 = safe_open(self.shard1_path, framework="pt", device="cpu")
-        self._sf94 = safe_open(self.shard94_path, framework="pt", device="cpu")
-        l0_dev = self.device if self.total_vram_gb >= 12.0 else torch.device("cpu")
-        self.layer0_cache: Dict[str, torch.Tensor] = {
-            k: self._sf1.get_tensor(k).to(l0_dev) for k in self._sf1.keys()
-        }
+        # Cache Shard 1 (Layer 0 dense) if start_layer == 0, and Shard 94 (embed_tokens / norm / lm_head)
+        self.layer0_cache: Dict[str, torch.Tensor] = {}
+        if self.start_layer == 0:
+            self.shard1_path, _ = self._resolve_shard(1, keep_cached=True)
+            self._sf1 = safe_open(self.shard1_path, framework="pt", device="cpu")
+            l0_dev = self.device if self.total_vram_gb >= 12.0 else torch.device("cpu")
+            self.layer0_cache = {k: self._sf1.get_tensor(k).to(l0_dev) for k in self._sf1.keys()}
 
+        self.shard94_path, _ = self._resolve_shard(94, keep_cached=True)
+        self._sf94 = safe_open(self.shard94_path, framework="pt", device="cpu")
         s94_keys = set(self._sf94.keys())
         out_rn_k = "language_model.model.output_attn_res_norm.weight"
         out_rp_k = "language_model.model.output_attn_res_proj.weight"
-        self.out_attn_res_norm = self._sf94.get_tensor(out_rn_k).to(self.device) if out_rn_k in s94_keys else None
-        self.out_attn_res_proj = self._sf94.get_tensor(out_rp_k).to(self.device).squeeze() if out_rp_k in s94_keys else None
-        self.final_norm_w = self._sf94.get_tensor("language_model.model.norm.weight").to(self.device)
-        head_dev = self.device if self.total_vram_gb >= 12.0 else torch.device("cpu")
-        self.lm_head_w = self._sf94.get_tensor("language_model.lm_head.weight").to(device=head_dev, dtype=self.out_dtype)
+        if self.peer_addr is None:
+            self.out_attn_res_norm = self._sf94.get_tensor(out_rn_k).to(self.device) if out_rn_k in s94_keys else None
+            self.out_attn_res_proj = self._sf94.get_tensor(out_rp_k).to(self.device).squeeze() if out_rp_k in s94_keys else None
+            self.final_norm_w = self._sf94.get_tensor("language_model.model.norm.weight").to(self.device)
+            head_dev = self.device if self.total_vram_gb >= 12.0 else torch.device("cpu")
+            self.lm_head_w = self._sf94.get_tensor("language_model.lm_head.weight").to(device=head_dev, dtype=self.out_dtype)
+        else:
+            self.out_attn_res_norm = None
+            self.out_attn_res_proj = None
+            self.final_norm_w = None
+            self.lm_head_w = None
 
-        # Initialize persistent multi-GPU / RAM TieredMoECacheManagers for available MoE shards
+        # Initialize persistent multi-GPU / RAM TieredMoECacheManagers for assigned MoE layer range
         self.layer_managers: Dict[int, TieredMoECacheManager] = {}
         shard_paths: Dict[int, str] = {}
-        for li in range(1, self.max_layers):
+        for li in range(max(1, self.start_layer), self.end_layer):
             fname = f"model-{li + 1:05d}-of-000096.safetensors"
             if self.local_dir is not None and (self.local_dir / fname).exists():
                 shard_paths[li] = str(self.local_dir / fname)
@@ -593,27 +609,62 @@ class KimiCoderEngine:
         path = hf_hub_download(repo_id=self.model_id_or_dir, filename=fname, local_dir=str(tmp_dir))
         return path, str(tmp_dir)
 
+    @staticmethod
+    def _recv_exact(sock: socket.socket, n: int) -> bytes:
+        buf = bytearray(n)
+        view = memoryview(buf)
+        pos = 0
+        while pos < n:
+            r = sock.recv_into(view[pos:], n - pos)
+            if r == 0:
+                raise ConnectionError("Peer RPC socket closed")
+            pos += r
+        return bytes(buf)
+
+    def _get_peer_socket(self) -> socket.socket:
+        if self._peer_sock is None:
+            host, port_s = self.peer_addr.rsplit(":", 1)
+            s = socket.create_connection((host, int(port_s)), timeout=300)
+            s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+            except OSError:
+                pass
+            self._peer_sock = s
+        return self._peer_sock
+
+    def _rpc_forward(self, cur: torch.Tensor, bres: List[torch.Tensor], reset_cache: bool) -> torch.Tensor:
+        sock = self._get_peer_socket()
+        seq_len, dim = cur.shape
+        nb = len(bres)
+        packed = torch.stack([cur, *bres], dim=0).to(dtype=torch.float16, device="cpu").contiguous()
+        raw_bytes = bytes(packed.untyped_storage())
+        hdr = struct.pack("<IIII", 1 if reset_cache else 0, seq_len, dim, nb)
+        sock.sendall(hdr + raw_bytes)
+
+        resp_hdr = self._recv_exact(sock, 32)
+        vocab_sz, topk, v_used, v_tot, v_exp, r_used, r_tot, r_exp = struct.unpack("<IIffffff", resp_hdr)
+        self.peer_stats = {
+            "vram_used_gb": v_used, "vram_total_gb": v_tot, "vram_experts": int(v_exp),
+            "ram_used_gb": r_used, "ram_total_gb": r_tot, "ram_experts": int(r_exp),
+        }
+        body = self._recv_exact(sock, topk * 6)
+        vals = torch.frombuffer(bytearray(body[: topk * 2]), dtype=torch.float16).float()
+        idxs = torch.frombuffer(bytearray(body[topk * 2 :]), dtype=torch.int32).long()
+        logits = torch.full((vocab_sz,), -1e9, dtype=torch.float32)
+        logits[idxs] = vals
+        return logits
+
     @torch.no_grad()
-    def forward_last_logits(
+    def _run_layer_range(
         self,
-        input_ids: List[int],
+        cur: torch.Tensor,
+        bres: List[torch.Tensor],
         layer_out_cache: Optional[Dict] = None,
-    ) -> torch.Tensor:
-        cached_len = layer_out_cache.get("_seq_len", 0) if layer_out_cache is not None else 0
-        if 0 < cached_len < len(input_ids):
-            active_ids = input_ids[cached_len:]
-        else:
-            if layer_out_cache is not None:
-                layer_out_cache.clear()
-            active_ids = input_ids
-        ids_cpu = torch.tensor(active_ids, dtype=torch.long, device="cpu")
-        emb_slice = self._sf94.get_slice("language_model.model.embed_tokens.weight")
-        h = emb_slice[ids_cpu].to(self.device).float()
-
-        bres: List[torch.Tensor] = []
-        cur = h
-
-        for li in range(self.max_layers):
+    ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+        num_local = max(self.end_layer - max(1, self.start_layer), 1)
+        for li in range(self.start_layer, self.end_layer):
             shard_idx = li + 1
             mgr = self.layer_managers.get(li)
             next_mgr = self.layer_managers.get(li + 1)
@@ -637,8 +688,8 @@ class KimiCoderEngine:
                         shard_path=spath,
                         layer_idx=li,
                         device=str(self.device),
-                        vram_hot_budget_gb=(self.total_vram_gb * 0.84) / max(self.max_layers - 1, 1),
-                        ram_warm_budget_gb=(self.total_ram_gb * 0.80) / max(self.max_layers - 1, 1),
+                        vram_hot_budget_gb=(self.total_vram_gb * 0.84) / num_local,
+                        ram_warm_budget_gb=(self.total_ram_gb * 0.80) / num_local,
                         promote_cold_to_ram=True,
                         force_arch_sm=self.force_arch_sm,
                         eager_preload=False,
@@ -687,10 +738,10 @@ class KimiCoderEngine:
                     sf_ctx.__exit__(None, None, None)
                 if tmp_dir is not None:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
+        return cur, bres
 
-        if layer_out_cache is not None:
-            layer_out_cache["_seq_len"] = len(input_ids)
-
+    @torch.no_grad()
+    def _compute_final_logits(self, cur: torch.Tensor, bres: List[torch.Tensor]) -> torch.Tensor:
         cur = cur.to(self.device)
         bres = [b.to(self.device) for b in bres]
         if bres and self.out_attn_res_norm is not None and self.out_attn_res_proj is not None:
@@ -700,6 +751,89 @@ class KimiCoderEngine:
         h_last = gpu_rmsnorm(h_final, self.final_norm_w)
         logits = (h_last.to(device=self.lm_head_w.device, dtype=self.lm_head_w.dtype) @ self.lm_head_w.T).float().squeeze(0)
         return logits
+
+    @torch.no_grad()
+    def forward_last_logits(
+        self,
+        input_ids: List[int],
+        layer_out_cache: Optional[Dict] = None,
+    ) -> torch.Tensor:
+        cached_len = layer_out_cache.get("_seq_len", 0) if layer_out_cache is not None else 0
+        reset_cache = not (0 < cached_len < len(input_ids))
+        if not reset_cache:
+            active_ids = input_ids[cached_len:]
+        else:
+            if layer_out_cache is not None:
+                layer_out_cache.clear()
+            active_ids = input_ids
+        ids_cpu = torch.tensor(active_ids, dtype=torch.long, device="cpu")
+        emb_slice = self._sf94.get_slice("language_model.model.embed_tokens.weight")
+        h = emb_slice[ids_cpu].to(self.device).float()
+
+        cur, bres = self._run_layer_range(h, [], layer_out_cache=layer_out_cache)
+        if layer_out_cache is not None:
+            layer_out_cache["_seq_len"] = len(input_ids)
+
+        if self.peer_addr is not None:
+            return self._rpc_forward(cur, bres, reset_cache=reset_cache)
+        return self._compute_final_logits(cur, bres)
+
+    @torch.no_grad()
+    def serve_rpc_worker(self, host: str = "0.0.0.0", port: int = 9100) -> None:
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        srv.bind((host, port))
+        srv.listen(4)
+        print(
+            f"[Strata-Coder 100G DAC Worker] Listening on {host}:{port} "
+            f"(Layers {self.start_layer}..{self.end_layer - 1}, VRAM={self.total_vram_gb:.1f}GB, RAM={self.total_ram_gb:.1f}GB)",
+            flush=True,
+        )
+        worker_cache: Dict[int, Dict] = {}
+        while True:
+            conn, addr = srv.accept()
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            try:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+            except OSError:
+                pass
+            print(f"[Strata-Coder 100G DAC Worker] Connected to master {addr[0]}:{addr[1]}", flush=True)
+            try:
+                while True:
+                    hdr = self._recv_exact(conn, 16)
+                    reset_flag, seq_len, dim, nb = struct.unpack("<IIII", hdr)
+                    if reset_flag:
+                        worker_cache.clear()
+                    nbytes = (1 + nb) * seq_len * dim * 2
+                    payload = self._recv_exact(conn, nbytes)
+                    stacked = torch.frombuffer(bytearray(payload), dtype=torch.float16).view(1 + nb, seq_len, dim).to(self.device).float()
+                    cur_in = stacked[0]
+                    bres_in = [stacked[i + 1] for i in range(nb)]
+                    cur_out, bres_out = self._run_layer_range(cur_in, bres_in, layer_out_cache=worker_cache)
+                    if self.peer_addr is not None:
+                        logits = self._rpc_forward(cur_out, bres_out, reset_cache=bool(reset_flag))
+                    else:
+                        logits = self._compute_final_logits(cur_out, bres_out)
+                    topk = min(256, logits.numel())
+                    vals, idxs = torch.topk(logits, k=topk)
+                    vals_b = bytes(vals.to(dtype=torch.float16, device="cpu").contiguous().untyped_storage())
+                    idxs_b = bytes(idxs.to(dtype=torch.int32, device="cpu").contiguous().untyped_storage())
+                    v_exp = sum(len(m.vram_cache) for m in self.layer_managers.values())
+                    r_exp = sum(len(m.ram_cache) for m in self.layer_managers.values())
+                    v_used = sum(m.vram_used_bytes for m in self.layer_managers.values()) / (1024 ** 3)
+                    r_used = sum(m.ram_used_bytes for m in self.layer_managers.values()) / (1024 ** 3)
+                    resp_hdr = struct.pack(
+                        "<IIffffff",
+                        int(logits.numel()), topk,
+                        float(v_used), float(self.total_vram_gb), float(v_exp),
+                        float(r_used), float(self.total_ram_gb), float(r_exp),
+                    )
+                    conn.sendall(resp_hdr + vals_b + idxs_b)
+            except (ConnectionError, OSError) as exc:
+                print(f"[Strata-Coder 100G DAC Worker] Connection closed ({exc}); awaiting reconnect...", flush=True)
+            finally:
+                conn.close()
 
     @torch.no_grad()
     def generate_stream(

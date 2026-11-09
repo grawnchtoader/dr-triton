@@ -238,22 +238,25 @@ def make_handler(engine: KimiCoderEngine, default_max_tokens: int):
 
     def build_monitor_payload() -> Dict[str, Any]:
         smi = _query_nvidia_smi()
-        vram_exp = sum(len(m.vram_cache) for m in engine.layer_managers.values())
-        ram_exp = sum(len(m.ram_cache) for m in engine.layer_managers.values())
-        vram_exp_gb = sum(m.vram_used_bytes for m in engine.layer_managers.values()) / (1024 ** 3)
-        ram_exp_gb = sum(m.ram_used_bytes for m in engine.layer_managers.values()) / (1024 ** 3)
-        vram_alloc = (torch.cuda.memory_allocated(0) / (1024 ** 3)) if torch.cuda.is_available() else vram_exp_gb
+        ps = getattr(engine, "peer_stats", None) or {}
+        vram_exp = sum(len(m.vram_cache) for m in engine.layer_managers.values()) + int(ps.get("vram_experts", 0))
+        ram_exp = sum(len(m.ram_cache) for m in engine.layer_managers.values()) + int(ps.get("ram_experts", 0))
+        vram_exp_gb = sum(m.vram_used_bytes for m in engine.layer_managers.values()) / (1024 ** 3) + float(ps.get("vram_used_gb", 0.0))
+        ram_exp_gb = sum(m.ram_used_bytes for m in engine.layer_managers.values()) / (1024 ** 3) + float(ps.get("ram_used_gb", 0.0))
+        vram_alloc = (torch.cuda.memory_allocated(0) / (1024 ** 3)) if torch.cuda.is_available() else 0.0
+        m_raw = str(engine.model_id_or_dir)
+        m_disp = Path(m_raw).name if os.path.exists(m_raw) else m_raw
         return {
             "state": state["phase"],
-            "model": str(engine.model_id_or_dir),
+            "model": m_disp,
             "decode_tps": state["decode_tps"],
             "prefill_tps": state["prefill_tps"],
             "vram_used_gb": max(vram_alloc, vram_exp_gb),
-            "vram_total_gb": engine.total_vram_gb,
+            "vram_total_gb": engine.total_vram_gb + float(ps.get("vram_total_gb", 0.0)),
             "vram_experts": vram_exp,
             "vram_expert_gb": vram_exp_gb,
             "ram_used_gb": ram_exp_gb,
-            "ram_total_gb": engine.total_ram_gb,
+            "ram_total_gb": engine.total_ram_gb + float(ps.get("ram_total_gb", 0.0)),
             "ram_experts": ram_exp,
             "ram_expert_gb": ram_exp_gb,
             "requests": state["requests"],
@@ -309,7 +312,7 @@ def make_handler(engine: KimiCoderEngine, default_max_tokens: int):
             elif self.path == "/v1/status":
                 mon = build_monitor_payload()
                 payload = {
-                    "engine": "dr-triton-3tier",
+                    "engine": "strata-coder-3tier",
                     "activity": {"requests": len(state["requests"])},
                     "machine": {
                         "gpu": {
@@ -421,6 +424,10 @@ def main():
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--cache-dir", default=None)
     ap.add_argument("--max-layers", type=int, default=93)
+    ap.add_argument("--start-layer", type=int, default=0, help="First layer index on this node (inclusive)")
+    ap.add_argument("--end-layer", type=int, default=None, help="Last layer index on this node (exclusive)")
+    ap.add_argument("--peer", type=str, default=None, help="Next pipeline node host:port over 100G DAC (e.g. 10.10.10.2:9100)")
+    ap.add_argument("--worker-port", type=int, default=None, help="Run as 100G DAC pipeline RPC worker listening on this TCP port")
     ap.add_argument("--vram-gb", type=float, default=None)
     ap.add_argument("--ram-gb", type=float, default=None)
     ap.add_argument("--host", default="127.0.0.1")
@@ -431,7 +438,10 @@ def main():
     ap.add_argument("--prompt", type=str, default=None, help="Run a single prompt and exit")
     args = ap.parse_args()
 
-    print(f"[Strata-Coder] Initializing KimiCoderEngine ({args.model}, max_layers={args.max_layers})...", flush=True)
+    print(
+        f"[Strata-Coder] Initializing KimiCoderEngine ({args.model}, layers={args.start_layer}..{args.end_layer or args.max_layers})...",
+        flush=True,
+    )
     engine = KimiCoderEngine(
         model_id_or_dir=args.model,
         device=args.device,
@@ -439,13 +449,21 @@ def main():
         max_layers=args.max_layers,
         total_vram_gb=args.vram_gb,
         total_ram_gb=args.ram_gb,
+        start_layer=args.start_layer,
+        end_layer=args.end_layer,
+        peer_addr=args.peer,
     )
     print(
         f"[Strata-Coder] Ready | Device: {engine.device} | Compute Dtype: {engine.out_dtype} | "
+        f"Layers: {engine.start_layer}..{engine.end_layer - 1} | Peer: {engine.peer_addr or 'None'} | "
         f"Detected VRAM: {engine.total_vram_gb:.1f} GB | Detected RAM: {engine.total_ram_gb:.1f} GB | "
         f"Resident Layer Caches: {len(engine.layer_managers)}",
         flush=True,
     )
+
+    if args.worker_port is not None:
+        engine.serve_rpc_worker(host=args.host if args.host != "127.0.0.1" else "0.0.0.0", port=args.worker_port)
+        return
 
     if args.prompt is not None:
         for tok_str in engine.generate_stream(args.prompt, max_new_tokens=args.max_tokens, temperature=args.temperature):
